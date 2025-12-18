@@ -1,4 +1,11 @@
 {
+  "routes": [
+    {
+      "src": "/api/query",
+      "methods": ["POST", "OPTIONS"],
+      "dest": "/api/query"
+    }
+  ],
   "headers": [
     {
       "source": "/api/(.*)",
