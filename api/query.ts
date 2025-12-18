@@ -4,6 +4,22 @@ export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ) {
+  // ✅ ALWAYS include CORS header on every response
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "https://brickhouser3.github.io"
+  );
+  res.setHeader("Vary", "Origin");
+
+  // ❌ Explicitly reject GET but WITH CORS
+  if (req.method === "GET") {
+    return res.status(405).json({ error: "GET not supported" });
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
@@ -20,13 +36,13 @@ export default async function handler(
         method: "POST",
         headers: {
           Authorization: `Bearer ${process.env.DATABRICKS_TOKEN}`,
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({
           statement:
             "select max(cal_dt) as max_cal_dt from vip.bir.bir_weekly_ind",
-          warehouse_id: process.env.WAREHOUSE_ID
-        })
+          warehouse_id: process.env.WAREHOUSE_ID,
+        }),
       }
     );
 
@@ -35,7 +51,7 @@ export default async function handler(
   } catch (err: any) {
     return res.status(500).json({
       error: "Databricks query failed",
-      details: err.message
+      details: err.message,
     });
   }
 }
