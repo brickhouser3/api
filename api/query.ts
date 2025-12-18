@@ -4,10 +4,15 @@ export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ) {
+  // 🔎 Debug header to prove THIS handler is executing
+  res.setHeader("X-Handler-Version", "query-node-v1");
+
+  // ✅ ALWAYS allow OPTIONS
   if (req.method === "OPTIONS") {
     return res.status(200).end();
   }
 
+  // 🔒 Only POST allowed beyond this point
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
