@@ -1,11 +1,22 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const API_VERSION = "2026-01-14_corsfix_secure_final";
+const API_VERSION = "2026-01-14_volume_kpi_v2";
+
+// ✅ 1. Define the Data Contract
+type KpiRequestV1 = {
+  contract_version: "kpi_request.v1";
+  kpi: "volume" | "revenue" | "share"; // expandable
+  filters?: {
+    megabrand?: string[];
+    wholesaler_id?: string[];
+    channel?: string[];
+  };
+};
 
 function setCors(req: VercelRequest, res: VercelResponse) {
   const origin = req.headers.origin || "";
 
-  // ✅ Security Check: Only allow Localhost and your GitHub Pages
+  // ✅ Security: Allow Localhost + Your Production Domains
   const isLocalhost =
     origin.startsWith("http://localhost") ||
     origin.startsWith("https://localhost") ||
@@ -13,25 +24,22 @@ function setCors(req: VercelRequest, res: VercelResponse) {
 
   const allowedDomains = ["https://brickhouser3.github.io"];
 
-  // Only set the header if the origin matches our allowlist
   if (isLocalhost || allowedDomains.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
 
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  
-  // ✅ Keep 'Accept' to prevent browser blocks
   res.setHeader(
-    "Access-Control-Allow-Headers", 
+    "Access-Control-Allow-Headers",
     "Content-Type, Authorization, Accept, x-mc-api, x-mc-version"
   );
-
-  // ✅ Added 'Access-Control-Allow-Origin' here so your UI shows the value instead of "(missing)"
+  
+  // Expose headers so your frontend can see debug info
   res.setHeader(
-    "Access-Control-Expose-Headers", 
+    "Access-Control-Expose-Headers",
     "x-mc-api, x-mc-origin, x-mc-version, Content-Length, Access-Control-Allow-Origin"
   );
-  
+
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
@@ -39,20 +47,13 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-type KpiRequestV1 = {
-  contract_version: "kpi_request.v1";
-  kpi: string;
-};
-
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
 
   // Handle Preflight
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
 
-  // Debug headers
+  // Debug Headers
   res.setHeader("x-mc-api", "query.ts");
   res.setHeader("x-mc-version", API_VERSION);
 
@@ -60,9 +61,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (req.method === "GET") {
       return res.status(200).json({
         ok: true,
-        now: new Date().toISOString(),
+        status: "operational",
         version: API_VERSION,
-        status: "operational"
+        note: "Use POST to query KPIs"
       });
     }
 
@@ -70,18 +71,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(405).json({ ok: false, error: "Method not allowed" });
     }
 
-    const body: any = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
+    // Parse Body
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
 
+    // Ping / Transport Check
     if (body?.ping === true) {
       return res.status(200).json({
         ok: true,
         mode: "ping",
-        version: API_VERSION,
-        received_origin: req.headers.origin || "unknown"
+        version: API_VERSION
       });
     }
 
-    // --- DATABRICKS LOGIC ---
+    // --- DATABRICKS CONNECTION CHECKS ---
     const host = process.env.DATABRICKS_HOST;
     const token = process.env.DATABRICKS_TOKEN;
     const warehouseId = process.env.WAREHOUSE_ID;
@@ -89,27 +91,69 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!host || !token || !warehouseId) {
       return res.status(500).json({
         ok: false,
-        error: "Server configuration error",
+        error: "Server missing Databricks credentials",
         version: API_VERSION
       });
     }
 
-    const parsed = body as Partial<KpiRequestV1>;
-    let statement = "select max(cal_dt) as value from vip.bir.bir_weekly_ind"; 
+    const { kpi, filters } = body as KpiRequestV1;
 
-    if (parsed?.contract_version === "kpi_request.v1" && parsed?.kpi === "volume") {
-      statement = "select max(cal_dt) as value from vip.bir.bir_weekly_ind";
+    // ✅ 2. DYNAMIC SQL BUILDER
+    let finalSql = "";
+    
+    // Default Base Table (The one you just created)
+    const volumeTable = "commercial_dev.capabilities.mbmc_actuals_volume";
+
+    if (kpi === "volume") {
+      // Build WHERE Clause dynamically
+      const conditions: string[] = ["1=1"]; // Default true prevents syntax errors if no filters
+
+      if (filters?.megabrand && filters.megabrand.length > 0) {
+        // Safe string formatting for SQL IN clause
+        const list = filters.megabrand.map(s => `'${s.replace(/'/g, "''")}'`).join(",");
+        conditions.push(`megabrand IN (${list})`);
+      }
+
+      if (filters?.wholesaler_id && filters.wholesaler_id.length > 0) {
+        const list = filters.wholesaler_id.map(s => `'${s.replace(/'/g, "''")}'`).join(",");
+        conditions.push(`WSLR_NBR IN (${list})`);
+      }
+
+      if (filters?.channel && filters.channel.length > 0) {
+        const list = filters.channel.map(s => `'${s.replace(/'/g, "''")}'`).join(",");
+        conditions.push(`channel IN (${list})`);
+      }
+
+      // Construct Final SQL
+      // Aggregating by Month (Time Series) is the standard default for charts
+      finalSql = `
+        SELECT 
+          cal_yr_mo_nbr,
+          SUM(BBLs) as bbls_cy,
+          SUM(BBLs_LY) as bbls_ly
+        FROM ${volumeTable}
+        WHERE ${conditions.join(" AND ")}
+        GROUP BY cal_yr_mo_nbr
+        ORDER BY cal_yr_mo_nbr
+      `;
+    } 
+    else {
+      // Fallback or Error for unknown KPIs
+      return res.status(400).json({ 
+        ok: false, 
+        error: `KPI '${kpi}' is not yet implemented.` 
+      });
     }
 
+    // --- EXECUTE ON DATABRICKS ---
     const submitRes = await fetch(`${host}/api/2.0/sql/statements`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
-        Accept: "application/json",
       },
       body: JSON.stringify({
-        statement,
+        statement: finalSql,
         warehouse_id: warehouseId,
       }),
     });
@@ -120,21 +164,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(submitRes.status).json({
         ok: false,
         error: "Databricks submit failed",
-        dbx_msg: submitted?.message
+        dbx_msg: submitted?.message,
+        sql_debug: finalSql // Helpful for debugging!
       });
     }
 
     const statementId = submitted?.statement_id;
     if (!statementId) throw new Error("No statement_id returned");
 
-    const deadlineMs = Date.now() + 12_000;
+    // --- POLLING LOOP ---
+    const deadlineMs = Date.now() + 15_000; // 15s timeout
     let last = submitted;
 
     while (Date.now() < deadlineMs) {
       const state = last?.status?.state;
       if (state === "SUCCEEDED" || state === "FAILED" || state === "CANCELED") break;
       
-      await sleep(500);
+      await sleep(350); // fast polling
       
       const pollRes = await fetch(`${host}/api/2.0/sql/statements/${statementId}`, {
         method: "GET",
@@ -147,14 +193,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(502).json({
         ok: false,
         error: "Query timed out or failed",
-        state: last?.status?.state
+        state: last?.status?.state,
+        sql_debug: finalSql
       });
     }
 
+    // ✅ Success Return
     return res.status(200).json({
       ok: true,
       result: last.result,
-      version: API_VERSION
+      version: API_VERSION,
+      meta: {
+        sql_generated: finalSql // Return this so you can verify the query logic in your UI
+      }
     });
 
   } catch (err: any) {
