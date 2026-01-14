@@ -1,16 +1,28 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const API_VERSION = "2026-01-14_corsfix_v4"; // ✅ Bumped version
+const API_VERSION = "2026-01-14_corsfix_nuclear_v1";
 
 function setCors(req: VercelRequest, res: VercelResponse) {
-  // NUCLEAR DEBUGGING: Allow everyone
-  res.setHeader("Access-Control-Allow-Origin", "*"); 
+  // NUCLEAR FIX: Allow ANY origin to access this API
+  res.setHeader("Access-Control-Allow-Origin", "*");
   
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, x-mc-api");
+  // Allow all standard methods
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  
+  // Allow the headers your app is sending
+  res.setHeader(
+    "Access-Control-Allow-Headers", 
+    "Content-Type, Authorization, Accept, x-mc-api, x-mc-version"
+  );
+
+  // Critical for debugging: Let the frontend see these custom headers
+  res.setHeader(
+    "Access-Control-Expose-Headers", 
+    "x-mc-api, x-mc-origin, x-mc-version, Content-Length"
+  );
+  
+  // Cache the preflight response for 24 hours so browsers stop asking
   res.setHeader("Access-Control-Max-Age", "86400");
-  res.setHeader("Access-Control-Expose-Headers", "x-mc-api,x-mc-origin,x-mc-version");
-  res.setHeader("Cache-Control", "no-store");
 }
 
 function sleep(ms: number) {
@@ -23,76 +35,66 @@ type KpiRequestV1 = {
 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // ✅ Always set CORS + debug headers first, for every path
+  // 1. Set CORS headers immediately
   setCors(req, res);
 
+  // 2. Handle the Preflight (Browser Handshake)
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  // Debug headers
   res.setHeader("x-mc-api", "query.ts");
-  res.setHeader("x-mc-origin", String(req.headers.origin || "(none)"));
   res.setHeader("x-mc-version", API_VERSION);
 
-  // ✅ Preflight must return with headers already set
-  if (req.method === "OPTIONS") return res.status(204).end();
-
-  // ✅ Health
-  if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      now: new Date().toISOString(),
-      version: API_VERSION,
-    });
-  }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
-  }
-
   try {
-    const body: any =
-      typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
+    // 3. Health Check (GET)
+    if (req.method === "GET") {
+      return res.status(200).json({
+        ok: true,
+        now: new Date().toISOString(),
+        version: API_VERSION,
+        status: "operational"
+      });
+    }
 
+    // 4. Method Check
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, error: "Method not allowed" });
+    }
+
+    // 5. Parse Body safely
+    const body: any = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
+
+    // Ping check
     if (body?.ping === true) {
       return res.status(200).json({
         ok: true,
         mode: "ping",
-        now: new Date().toISOString(),
         version: API_VERSION,
-        received: body,
+        received_origin: req.headers.origin || "unknown"
       });
     }
 
+    // --- DATABRICKS LOGIC ---
     const host = process.env.DATABRICKS_HOST;
     const token = process.env.DATABRICKS_TOKEN;
     const warehouseId = process.env.WAREHOUSE_ID;
 
     if (!host || !token || !warehouseId) {
+      // console.error("Missing Databricks Envs"); // Uncomment to view in Vercel Logs
       return res.status(500).json({
         ok: false,
-        error: "Missing Databricks env vars",
-        version: API_VERSION,
-        hasHost: !!host,
-        hasToken: !!token,
-        hasWarehouseId: !!warehouseId,
+        error: "Server configuration error (missing secrets)",
+        version: API_VERSION
       });
     }
 
     const parsed = body as Partial<KpiRequestV1>;
+    let statement = "select max(cal_dt) as value from vip.bir.bir_weekly_ind"; 
 
-    let statement =
-      "select max(cal_dt) as value from vip.bir.bir_weekly_ind"; // default
-
-    if (parsed?.contract_version === "kpi_request.v1") {
-      switch (parsed?.kpi) {
-        case "volume":
-          statement =
-            "select max(cal_dt) as value from vip.bir.bir_weekly_ind";
-          break;
-        default:
-          return res.status(400).json({
-            ok: false,
-            error: `Unknown kpi '${parsed?.kpi}'`,
-            version: API_VERSION,
-          });
-      }
+    if (parsed?.contract_version === "kpi_request.v1" && parsed?.kpi === "volume") {
+      statement = "select max(cal_dt) as value from vip.bir.bir_weekly_ind";
     }
 
     const submitRes = await fetch(`${host}/api/2.0/sql/statements`, {
@@ -114,72 +116,50 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(submitRes.status).json({
         ok: false,
         error: "Databricks submit failed",
-        version: API_VERSION,
-        dbx: submitted,
+        dbx_msg: submitted?.message
       });
     }
 
-    const statementId: string | undefined = submitted?.statement_id;
-    if (!statementId) {
-      return res.status(502).json({
-        ok: false,
-        error: "Databricks did not return statement_id",
-        version: API_VERSION,
-        dbx: submitted,
-      });
-    }
+    const statementId = submitted?.statement_id;
+    if (!statementId) throw new Error("No statement_id returned");
 
+    // Polling logic
     const deadlineMs = Date.now() + 12_000;
     let last = submitted;
 
     while (Date.now() < deadlineMs) {
       const state = last?.status?.state;
-
-      if (state === "SUCCEEDED" && last?.result?.data_array) break;
-      if (state === "FAILED" || state === "CANCELED") break;
-
-      await sleep(350);
-
-      const pollRes = await fetch(
-        `${host}/api/2.0/sql/statements/${statementId}`,
-        {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: "application/json",
-          },
-        }
-      );
-
+      if (state === "SUCCEEDED" || state === "FAILED" || state === "CANCELED") break;
+      
+      await sleep(500);
+      
+      const pollRes = await fetch(`${host}/api/2.0/sql/statements/${statementId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` }
+      });
       last = await pollRes.json();
     }
 
-    const finalState = last?.status?.state;
-
-    if (finalState !== "SUCCEEDED" || !last?.result?.data_array) {
+    if (last?.status?.state !== "SUCCEEDED") {
       return res.status(502).json({
         ok: false,
-        error: "Databricks statement did not return results",
-        version: API_VERSION,
-        state: finalState,
-        statement_id: statementId,
-        dbx: last,
+        error: "Query timed out or failed",
+        state: last?.status?.state
       });
     }
 
     return res.status(200).json({
       ok: true,
-      version: API_VERSION,
       result: last.result,
-      statement_id: statementId,
-      state: finalState,
+      version: API_VERSION
     });
+
   } catch (err: any) {
+    console.error("API Crash:", err);
     return res.status(500).json({
       ok: false,
-      error: "Databricks query failed",
-      version: API_VERSION,
-      details: err?.message ?? "unknown",
+      error: "Internal Server Error",
+      details: err.message
     });
   }
 }
