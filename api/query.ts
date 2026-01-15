@@ -1,79 +1,88 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const API_VERSION = "2026-01-15_dynamic_cols_final_v2";
+const API_VERSION = "2026-01-15_agg_logic_v4";
 
 /* ======================================================
-   1. KPI CONFIGURATION (The "Brain")
+   1. KPI CONFIGURATION
 ====================================================== */
 const KPI_MAP: Record<
   string,
-  { table: string; col: string; hasChannel: boolean; geoColumn: string }
+  { 
+    table: string; 
+    col: string; 
+    hasChannel: boolean; 
+    geoColumn: string;
+    agg: "SUM" | "AVG"; // ✅ NEW: Controls math logic
+  }
 > = {
-  // Metric      Table Name                       Column Prefix (e.g. VAL_CY)   Channel?   Geo Col
+  // --- ADDITIVE METRICS (SUM) ---
   volume: {
     table: "mbmc_actuals_volume",
-    col: "STRs", 
+    col: "STRs",
     hasChannel: true,
     geoColumn: "WSLR_NBR",
+    agg: "SUM"
   },
   revenue: {
     table: "mbmc_actuals_revenue",
-    col: "net_rev", // Looks for net_rev_CY
+    col: "net_rev",
     hasChannel: false,
     geoColumn: "WSLR_NBR",
-  },
-  share: {
-    table: "mbmc_actuals_bir",
-    col: "shr", // Looks for shr_CY
-    hasChannel: true,
-    geoColumn: "WSLR_NBR",
+    agg: "SUM"
   },
   displays: {
     table: "mbmc_actuals_displays",
     col: "displays",
     hasChannel: true,
     geoColumn: "WSLR_NBR",
+    agg: "SUM"
   },
 
-  // ✅ SHARED DISTRO TABLE
+  // --- NON-ADDITIVE METRICS (AVG) ---
+  share: {
+    table: "mbmc_actuals_bir",
+    col: "shr",
+    hasChannel: true,
+    geoColumn: "WSLR_NBR",
+    agg: "AVG" // ✅ Fixes "200% share" issue
+  },
+  adshare: {
+    table: "mbmc_actuals_ads",
+    col: "ad_share",
+    hasChannel: true,
+    geoColumn: "KAM",
+    agg: "AVG"
+  },
+  
+  // --- DISTRO (RATES & SNAPSHOTS) ---
+  // Using AVG prevents double-counting across months (e.g. Jan+Feb PODs)
   pods: {
     table: "mbmc_actuals_distro",
     col: "pods",
     hasChannel: true,
     geoColumn: "WSLR_NBR",
+    agg: "AVG"
   },
   taps: {
     table: "mbmc_actuals_distro",
     col: "taps",
     hasChannel: true,
     geoColumn: "WSLR_NBR",
+    agg: "AVG"
   },
   avd: {
     table: "mbmc_actuals_distro",
     col: "avd",
     hasChannel: true,
     geoColumn: "WSLR_NBR",
-  },
-
-  // ✅ AD SHARE (KAMs)
-  adshare: {
-    table: "mbmc_actuals_ads",
-    col: "ad_share",
-    hasChannel: true,
-    geoColumn: "KAM", // Checks 'KAM' column instead of 'WSLR_NBR'
+    agg: "AVG"
   },
 };
 
 type KpiRequestV1 = {
   contract_version: "kpi_request.v1";
   kpi: string;
-  groupBy?:
-    | "time"
-    | "megabrand"
-    | "region"
-    | "state"
-    | "wholesaler"
-    | "channel";
+  groupBy?: "time" | "megabrand" | "region" | "state" | "wholesaler" | "channel";
   max_month?: string;
   scope?: "MTD" | "YTD";
   filters?: {
@@ -85,25 +94,15 @@ type KpiRequestV1 = {
 
 function setCors(req: VercelRequest, res: VercelResponse) {
   const origin = req.headers.origin || "";
-  const isLocalhost =
-    origin.startsWith("http://localhost") ||
-    origin.startsWith("https://localhost") ||
-    origin.startsWith("http://127.0.0.1");
+  const isLocalhost = origin.startsWith("http://localhost") || origin.startsWith("https://localhost") || origin.startsWith("http://127.0.0.1");
   const allowedDomains = ["https://brickhouser3.github.io"];
 
   if (isLocalhost || allowedDomains.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
-
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, Accept, x-mc-api, x-mc-version"
-  );
-  res.setHeader(
-    "Access-Control-Expose-Headers",
-    "x-mc-api, x-mc-origin, x-mc-version, Content-Length, Access-Control-Allow-Origin"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, x-mc-api, x-mc-version");
+  res.setHeader("Access-Control-Expose-Headers", "x-mc-api, x-mc-origin, x-mc-version, Content-Length, Access-Control-Allow-Origin");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
@@ -119,62 +118,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("x-mc-version", API_VERSION);
 
   try {
-    if (req.method === "GET") {
-      return res.status(200).json({
-        ok: true,
-        status: "operational",
-        version: API_VERSION,
-      });
-    }
+    if (req.method === "GET") return res.status(200).json({ ok: true, status: "operational", version: API_VERSION });
+    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
-    if (req.method !== "POST") {
-      return res.status(405).json({ ok: false, error: "Method not allowed" });
-    }
-
-    const body =
-      typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
-
-    if (body?.ping === true) {
-      return res.status(200).json({ ok: true, mode: "ping" });
-    }
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
+    if (body?.ping === true) return res.status(200).json({ ok: true, mode: "ping" });
 
     // --- CREDENTIALS ---
     const host = process.env.DATABRICKS_HOST;
     const token = process.env.DATABRICKS_TOKEN;
     const warehouseId = process.env.WAREHOUSE_ID;
 
-    if (!host || !token || !warehouseId) {
-      return res.status(500).json({
-        ok: false,
-        error: "Server missing Databricks credentials",
-      });
-    }
+    if (!host || !token || !warehouseId) return res.status(500).json({ ok: false, error: "Server missing Databricks credentials" });
 
-    const {
-      kpi,
-      filters,
-      groupBy = "time",
-      max_month = "202512",
-      scope = "YTD",
-    } = body as KpiRequestV1;
+    const { kpi, filters, groupBy = "time", max_month = "202512", scope = "YTD" } = body as KpiRequestV1;
 
     // --- 2. RESOLVE CONFIG ---
     const config = KPI_MAP[kpi];
-    if (!config) {
-      return res.status(400).json({
-        ok: false,
-        error: `KPI '${kpi}' is not configured in API map.`,
-      });
-    }
+    if (!config) return res.status(400).json({ ok: false, error: `KPI '${kpi}' is not configured in API map.` });
 
     const tableName = `commercial_dev.capabilities.${config.table}`;
     const colCy = `${config.col}_CY`;
     const colLy = `${config.col}_LY`;
+    const AGG_FUNC = config.agg; // "SUM" or "AVG"
 
     // --- 3. FILTER LOGIC ---
     const conditions: string[] = ["1=1"];
 
-    // ✅ TIME SCOPE LOGIC
     if (scope === "MTD") {
       conditions.push(`cal_yr_mo_nbr = ${max_month}`);
     } else {
@@ -182,11 +152,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       conditions.push(`cal_yr_mo_nbr BETWEEN ${startOfYear} AND ${max_month}`);
     }
 
-    // ✅ BRAND/DIMENSION FILTERS
     if (filters?.megabrand && filters.megabrand.length > 0) {
-      const list = filters.megabrand
-        .map((s) => `'${s.replace(/'/g, "''")}'`)
-        .join(",");
+      const list = filters.megabrand.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
       conditions.push(`megabrand IN (${list})`);
     }
 
@@ -202,26 +169,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         break;
 
       case "region":
-        // ✅ UPDATED: Using Code as requested
         selectClause = `sls_regn_cd as dimension`;
         groupByClause = `GROUP BY sls_regn_cd`;
         break;
 
       case "state":
-        // ✅ UPDATED: Using Code as requested
         selectClause = `mktng_st_cd as dimension`;
         groupByClause = `GROUP BY mktng_st_cd`;
         break;
 
       case "wholesaler":
-        // ✅ HANDLE AD SHARE (KAM) VS OTHERS (WSLR)
-        const geoCol = config.geoColumn; // WSLR_NBR or KAM
+        const geoCol = config.geoColumn;
         selectClause = `${geoCol} as dimension`;
         groupByClause = `GROUP BY ${geoCol}`;
         break;
 
       case "channel":
-        // ✅ HANDLE REVENUE (No Channel)
         if (!config.hasChannel) {
           selectClause = `'All Channels' as dimension`;
           groupByClause = ``;
@@ -239,10 +202,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         break;
     }
 
+    // --- 5. ASSEMBLE SQL WITH CORRECT AGGREGATION ---
+    // ✅ Uses AVG() or SUM() based on metric config
     const finalSql = `
       SELECT ${selectClause},
-      SUM(${colCy}) as val_cy,
-      SUM(${colLy}) as val_ly
+      ${AGG_FUNC}(${colCy}) as val_cy,
+      ${AGG_FUNC}(${colLy}) as val_ly
       FROM ${tableName}
       WHERE ${conditions.join(" AND ")}
       ${groupByClause}
@@ -250,29 +215,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       LIMIT 1000
     `;
 
-    // --- 5. EXECUTE ---
+    // --- 6. EXECUTE ---
     const submitRes = await fetch(`${host}/api/2.0/sql/statements`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        statement: finalSql,
-        warehouse_id: warehouseId,
-      }),
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ statement: finalSql, warehouse_id: warehouseId }),
     });
 
     const submitted = await submitRes.json();
-
-    if (!submitRes.ok) {
-      return res.status(submitRes.status).json({
-        ok: false,
-        error: "Databricks submit failed",
-        dbx_msg: submitted?.message,
-        sql: finalSql,
-      });
-    }
+    if (!submitRes.ok) return res.status(submitRes.status).json({ ok: false, error: "Databricks submit failed", dbx_msg: submitted?.message, sql: finalSql });
 
     const statementId = submitted?.statement_id;
     if (!statementId) throw new Error("No statement_id returned");
@@ -284,36 +235,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const state = last?.status?.state;
       if (["SUCCEEDED", "FAILED", "CANCELED"].includes(state)) break;
       await sleep(350);
-      const pollRes = await fetch(
-        `${host}/api/2.0/sql/statements/${statementId}`,
-        {
-          method: "GET",
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
+      const pollRes = await fetch(`${host}/api/2.0/sql/statements/${statementId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` }
+      });
       last = await pollRes.json();
     }
 
-    if (last?.status?.state !== "SUCCEEDED") {
-      return res.status(502).json({
-        ok: false,
-        error: "Query timed out or failed",
-        state: last?.status?.state,
-      });
-    }
+    if (last?.status?.state !== "SUCCEEDED") return res.status(502).json({ ok: false, error: "Query timed out or failed", state: last?.status?.state });
 
-    return res.status(200).json({
-      ok: true,
-      result: last.result,
-      version: API_VERSION,
-      meta: { sql: finalSql },
-    });
+    return res.status(200).json({ ok: true, result: last.result, version: API_VERSION, meta: { sql: finalSql } });
+
   } catch (err: any) {
     console.error("API Crash:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Internal Server Error",
-      details: err.message,
-    });
+    return res.status(500).json({ ok: false, error: "Internal Server Error", details: err.message });
   }
 }
