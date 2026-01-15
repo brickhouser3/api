@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const API_VERSION = "2026-01-15_dynamic_cols_final";
+const API_VERSION = "2026-01-15_dynamic_cols_final_v2";
 
 /* ======================================================
    1. KPI CONFIGURATION (The "Brain")
@@ -9,6 +9,7 @@ const KPI_MAP: Record<
   string,
   { table: string; col: string; hasChannel: boolean; geoColumn: string }
 > = {
+  // Metric      Table Name                       Column Prefix (e.g. VAL_CY)   Channel?   Geo Col
   volume: {
     table: "mbmc_actuals_volume",
     col: "STRs", 
@@ -17,13 +18,13 @@ const KPI_MAP: Record<
   },
   revenue: {
     table: "mbmc_actuals_revenue",
-    col: "net_rev", // Generates net_rev_CY
+    col: "net_rev", // Looks for net_rev_CY
     hasChannel: false,
     geoColumn: "WSLR_NBR",
   },
   share: {
     table: "mbmc_actuals_bir",
-    col: "shr", // Generates shr_CY
+    col: "shr", // Looks for shr_CY
     hasChannel: true,
     geoColumn: "WSLR_NBR",
   },
@@ -167,7 +168,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const tableName = `commercial_dev.capabilities.${config.table}`;
-    const colCy = `${config.col}_CY`; // e.g. net_rev_CY
+    const colCy = `${config.col}_CY`;
     const colLy = `${config.col}_LY`;
 
     // --- 3. FILTER LOGIC ---
@@ -201,13 +202,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         break;
 
       case "region":
-        selectClause = `sls_regn_nm as dimension`;
-        groupByClause = `GROUP BY sls_regn_nm`;
+        // ✅ UPDATED: Using Code as requested
+        selectClause = `sls_regn_cd as dimension`;
+        groupByClause = `GROUP BY sls_regn_cd`;
         break;
 
       case "state":
-        selectClause = `state_cd as dimension`;
-        groupByClause = `GROUP BY state_cd`;
+        // ✅ UPDATED: Using Code as requested
+        selectClause = `mktng_st_cd as dimension`;
+        groupByClause = `GROUP BY mktng_st_cd`;
         break;
 
       case "wholesaler":
