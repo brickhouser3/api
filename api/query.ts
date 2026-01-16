@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const API_VERSION = "2026-01-15_agg_logic_v4";
+const API_VERSION = "2026-01-15_agg_logic_v5_full_filters";
 
 /* ======================================================
    1. KPI CONFIGURATION
@@ -12,7 +12,7 @@ const KPI_MAP: Record<
     col: string; 
     hasChannel: boolean; 
     geoColumn: string;
-    agg: "SUM" | "AVG"; // ✅ NEW: Controls math logic
+    agg: "SUM" | "AVG"; 
   }
 > = {
   // --- ADDITIVE METRICS (SUM) ---
@@ -44,7 +44,7 @@ const KPI_MAP: Record<
     col: "shr",
     hasChannel: true,
     geoColumn: "WSLR_NBR",
-    agg: "AVG" // ✅ Fixes "200% share" issue
+    agg: "AVG"
   },
   adshare: {
     table: "mbmc_actuals_ads",
@@ -55,7 +55,6 @@ const KPI_MAP: Record<
   },
   
   // --- DISTRO (RATES & SNAPSHOTS) ---
-  // Using AVG prevents double-counting across months (e.g. Jan+Feb PODs)
   pods: {
     table: "mbmc_actuals_distro",
     col: "pods",
@@ -79,6 +78,7 @@ const KPI_MAP: Record<
   },
 };
 
+// ✅ UPDATED TYPE: Includes all filter keys
 type KpiRequestV1 = {
   contract_version: "kpi_request.v1";
   kpi: string;
@@ -87,8 +87,10 @@ type KpiRequestV1 = {
   scope?: "MTD" | "YTD";
   filters?: {
     megabrand?: string[];
-    wholesaler_id?: string[];
-    channel?: string[];
+    region?: string[];      // sls_regn_cd
+    state?: string[];       // mktng_st_cd
+    wholesaler_id?: string[]; // wslr_nbr
+    channel?: string[];     // channel
   };
 };
 
@@ -140,11 +142,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const tableName = `commercial_dev.capabilities.${config.table}`;
     const colCy = `${config.col}_CY`;
     const colLy = `${config.col}_LY`;
-    const AGG_FUNC = config.agg; // "SUM" or "AVG"
+    const AGG_FUNC = config.agg; 
 
     // --- 3. FILTER LOGIC ---
     const conditions: string[] = ["1=1"];
 
+    // A. TIME SCOPE
     if (scope === "MTD") {
       conditions.push(`cal_yr_mo_nbr = ${max_month}`);
     } else {
@@ -152,9 +155,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       conditions.push(`cal_yr_mo_nbr BETWEEN ${startOfYear} AND ${max_month}`);
     }
 
+    // B. MEGABRAND
     if (filters?.megabrand && filters.megabrand.length > 0) {
       const list = filters.megabrand.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
       conditions.push(`megabrand IN (${list})`);
+    }
+
+    // C. REGION (sls_regn_cd)
+    if (filters?.region && filters.region.length > 0) {
+      const list = filters.region.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+      conditions.push(`sls_regn_cd IN (${list})`);
+    }
+
+    // D. STATE (mktng_st_cd)
+    if (filters?.state && filters.state.length > 0) {
+      const list = filters.state.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+      conditions.push(`mktng_st_cd IN (${list})`);
+    }
+
+    // E. WHOLESALER (wslr_nbr)
+    if (filters?.wholesaler_id && filters.wholesaler_id.length > 0) {
+      const list = filters.wholesaler_id.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+      conditions.push(`wslr_nbr IN (${list})`);
+    }
+
+    // F. CHANNEL (channel)
+    if (filters?.channel && filters.channel.length > 0) {
+      if (config.hasChannel) {
+          const list = filters.channel.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+          conditions.push(`channel IN (${list})`);
+      } else {
+          // If filtering by channel on a metric that lacks channel, return NO DATA (safe fallback)
+          conditions.push("1=0"); 
+      }
     }
 
     // --- 4. DYNAMIC GROUPING ---
@@ -202,8 +235,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         break;
     }
 
-    // --- 5. ASSEMBLE SQL WITH CORRECT AGGREGATION ---
-    // ✅ Uses AVG() or SUM() based on metric config
+    // --- 5. ASSEMBLE SQL ---
     const finalSql = `
       SELECT ${selectClause},
       ${AGG_FUNC}(${colCy}) as val_cy,
