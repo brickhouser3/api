@@ -1,11 +1,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const API_VERSION = "2026-01-15_filters_v2_safe";
+const API_VERSION = "2026-01-15_filters_v3_patience";
 
 function setCors(req: VercelRequest, res: VercelResponse) {
   const origin = req.headers.origin || "";
-  
-  // ✅ ALLOW LOCALHOST explicitly
   const allowedDomains = [
       "https://brickhouser3.github.io", 
       "http://localhost:3000", 
@@ -16,22 +14,23 @@ function setCors(req: VercelRequest, res: VercelResponse) {
   if (allowedDomains.some(d => origin.startsWith(d))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
-  
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-mc-api, x-mc-version");
+}
+
+function sleep(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  // ✅ 1. Method Guard
   if (req.method !== "POST") {
       return res.status(405).json({ ok: false, error: "Method not allowed. Please use POST." });
   }
 
   try {
-    // ✅ 2. Safe Body Parsing (Prevents the "undefined" crash)
     const rawBody = req.body;
     const body = rawBody 
         ? (typeof rawBody === "string" ? JSON.parse(rawBody) : rawBody) 
@@ -39,12 +38,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const { dimension, table } = body;
 
-    // ✅ 3. Validation Check
+    // --- VALIDATION ---
     if (!dimension || !table) {
         return res.status(400).json({ ok: false, error: "Missing required fields: 'dimension' or 'table'" });
     }
 
-    // --- SECURITY: Allowlist ---
     const ALLOWED_COLS = ["wslr_nbr", "mktng_st_cd", "sls_regn_cd", "channel"];
     const ALLOWED_TABLES = ["mbmc_actuals_volume", "mbmc_actuals_revenue", "mbmc_actuals_distro"];
 
@@ -52,12 +50,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(400).json({ ok: false, error: `Invalid dimension '${dimension}' or table '${table}'` });
     }
 
-    // --- CREDENTIALS ---
     const host = process.env.DATABRICKS_HOST;
     const token = process.env.DATABRICKS_TOKEN;
     const warehouseId = process.env.WAREHOUSE_ID;
 
-    // --- SQL: Get Distinct Values ---
+    // --- SQL ---
     const sql = `
       SELECT DISTINCT ${dimension} as label 
       FROM commercial_dev.capabilities.${table} 
@@ -66,11 +63,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       LIMIT 2000
     `;
 
-    // --- EXECUTE ---
+    // --- SUBMIT QUERY ---
     const submitRes = await fetch(`${host}/api/2.0/sql/statements`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ statement: sql, warehouse_id: warehouseId }),
+      body: JSON.stringify({ statement: sql, warehouse_id: warehouseId, wait_timeout: "0s" }), // Async submit
     });
 
     const submitted = await submitRes.json();
@@ -80,24 +77,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         throw new Error(`Databricks Error: ${submitted?.message || "No statement_id returned"}`);
     }
 
-    // Polling logic
+    // --- POLLING (Increased Duration) ---
+    // Poll for up to 45 seconds to handle warehouse "cold start"
+    const DEADLINE = Date.now() + 45000; 
     let state = "PENDING";
     let result = null;
-    const start = Date.now();
     
-    while (state !== "SUCCEEDED" && state !== "FAILED" && Date.now() - start < 10000) {
-        await new Promise(r => setTimeout(r, 200));
+    while (Date.now() < DEADLINE) {
         const poll = await fetch(`${host}/api/2.0/sql/statements/${statementId}`, {
             headers: { Authorization: `Bearer ${token}` }
         });
         const json = await poll.json();
-        state = json.status.state;
-        if (state === "SUCCEEDED") result = json.result;
+        state = json.status?.state;
+
+        if (state === "SUCCEEDED") {
+            result = json.result;
+            break;
+        }
+        if (["FAILED", "CANCELED", "CLOSED"].includes(state)) {
+            throw new Error(`Query failed with state: ${state}. Error: ${json.status?.error?.message || "Unknown error"}`);
+        }
+
+        // Wait 1s before checking again to be gentle on the API
+        await sleep(1000);
     }
 
-    if (!result) throw new Error("Query timed out or failed");
+    if (!result) {
+        // If we timed out, try to cancel the query to be clean
+        await fetch(`${host}/api/2.0/sql/statements/${statementId}/cancel`, {
+             method: "POST", headers: { Authorization: `Bearer ${token}` } 
+        });
+        return res.status(504).json({ ok: false, error: "Query timed out after 45s (Warehouse likely starting up). Please try again." });
+    }
 
-    // Format for Dropdown
+    // --- FORMAT & RETURN ---
     const options = result.data_array.map((row: string[]) => ({
         label: row[0],
         value: row[0]
