@@ -1,260 +1,299 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-/* ==========================================================================
-   HELPER: CORS SETUP
-   ========================================================================== */
+const API_VERSION = "2026-01-15_agg_logic_v5_full_filters_w_AO";
+
+/* ======================================================
+   1. KPI CONFIGURATION
+====================================================== */
+const KPI_MAP: Record<
+  string,
+  { 
+    table: string; 
+    col: string; 
+    hasChannel: boolean; 
+    geoColumn: string;
+    agg: "SUM" | "AVG"; 
+  }
+> = {
+  // --- ADDITIVE METRICS (SUM) ---
+  volume: {
+    table: "mbmc_actuals_volume",
+    col: "STRs",
+    hasChannel: true,
+    geoColumn: "WSLR_NBR",
+    agg: "SUM"
+  },
+  revenue: {
+    table: "mbmc_actuals_revenue",
+    col: "net_rev",
+    hasChannel: false,
+    geoColumn: "WSLR_NBR",
+    agg: "SUM"
+  },
+  displays: {
+    table: "mbmc_actuals_displays",
+    col: "displays",
+    hasChannel: true,
+    geoColumn: "WSLR_NBR",
+    agg: "SUM"
+  },
+
+  // --- NON-ADDITIVE METRICS (AVG) ---
+  share: {
+    table: "mbmc_actuals_bir",
+    col: "shr",
+    hasChannel: true,
+    geoColumn: "WSLR_NBR",
+    agg: "AVG"
+  },
+  adshare: {
+    table: "mbmc_actuals_ads",
+    col: "ad_share",
+    hasChannel: true,
+    geoColumn: "KAM",
+    agg: "AVG"
+  },
+  
+  // --- DISTRO (RATES & SNAPSHOTS) ---
+  pods: {
+    table: "mbmc_actuals_distro",
+    col: "pods",
+    hasChannel: true,
+    geoColumn: "WSLR_NBR",
+    agg: "SUM"
+  },
+  taps: {
+    table: "mbmc_actuals_distro",
+    col: "taps",
+    hasChannel: true,
+    geoColumn: "WSLR_NBR",
+    agg: "SUM"
+  },
+  avd: {
+    table: "mbmc_actuals_distro",
+    col: "avd",
+    hasChannel: true,
+    geoColumn: "WSLR_NBR",
+    agg: "AVG"
+  },
+};
+
+// ✅ UPDATED TYPE: Added include_ao
+type KpiRequestV1 = {
+  contract_version: "kpi_request.v1";
+  kpi: string;
+  groupBy?: "time" | "megabrand" | "region" | "state" | "wholesaler" | "channel" | "total";
+  max_month?: string;
+  scope?: "MTD" | "YTD";
+  filters?: {
+    megabrand?: string[];
+    region?: string[];      // sls_regn_cd
+    state?: string[];       // mktng_st_cd
+    wholesaler_id?: string[]; // wslr_nbr
+    channel?: string[];     // channel
+    include_ao?: boolean;   // ✅ NEW FLAG
+  };
+};
+
 function setCors(req: VercelRequest, res: VercelResponse) {
   const origin = req.headers.origin || "";
-  res.setHeader("Access-Control-Allow-Origin", origin);
+  const isLocalhost = origin.startsWith("http://localhost") || origin.startsWith("https://localhost") || origin.startsWith("http://127.0.0.1");
+  const allowedDomains = ["https://brickhouser3.github.io"];
+
+  if (isLocalhost || allowedDomains.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-mc-api, x-mc-version");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, x-mc-api, x-mc-version");
+  res.setHeader("Access-Control-Expose-Headers", "x-mc-api, x-mc-origin, x-mc-version, Content-Length, Access-Control-Allow-Origin");
+  res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-/* ==========================================================================
-   MAIN HANDLER
-   ========================================================================== */
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed. Use POST." });
-  }
+  res.setHeader("x-mc-api", "query.ts");
+  res.setHeader("x-mc-version", API_VERSION);
 
   try {
-    const rawBody = req.body;
-    const body = rawBody ? (typeof rawBody === "string" ? JSON.parse(rawBody) : rawBody) : {};
-    
-    // Destructure inputs
-    const { 
-        contract_version, 
-        kpi, 
-        groupBy, 
-        max_month, 
-        scope, // "MTD" or "YTD"
-        filters,
-        months // Optional: Support for multi-select array if passed directly
-    } = body;
+    if (req.method === "GET") return res.status(200).json({ ok: true, status: "operational", version: API_VERSION });
+    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
-    if (!kpi || !max_month) {
-        return res.status(400).json({ ok: false, error: "Missing required parameters: 'kpi' or 'max_month'" });
-    }
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
+    if (body?.ping === true) return res.status(200).json({ ok: true, mode: "ping" });
 
-    /* ----------------------------------------------------------------------
-       1. TABLE RESOLUTION
-       Maps the requested KPI to the specific Databricks table.
-       ---------------------------------------------------------------------- */
-    let table = "mbmc_actuals_volume"; // Default fallback
-
-    switch (kpi) {
-        case "volume":
-            table = "mbmc_actuals_volume";
-            break;
-        case "revenue":
-            table = "mbmc_actuals_revenue";
-            break;
-        case "share":
-            table = "mbmc_actuals_share";
-            break;
-        case "adshare":
-            table = "mbmc_actuals_adshare";
-            break;
-        case "pods":
-            table = "mbmc_actuals_pods";
-            break;
-        case "taps":
-            table = "mbmc_actuals_taps";
-            break;
-        case "displays":
-            table = "mbmc_actuals_displays";
-            break;
-        case "avd":
-            table = "mbmc_actuals_avd";
-            break;
-        default:
-            // Fallback allows specialized queries if needed, or defaults to volume
-            table = "mbmc_actuals_volume"; 
-    }
-
-    /* ----------------------------------------------------------------------
-       2. DATE SCOPE LOGIC (MTD vs YTD)
-       ---------------------------------------------------------------------- */
-    // Ensure inputs are sanitized to avoid basic injection (simple alphanumeric check)
-    const safeMonth = max_month.replace(/[^0-9]/g, ""); 
-    
-    let dateCondition = "";
-    
-    if (scope === "MTD") {
-        // Exact month match
-        dateCondition = `month = '${safeMonth}'`;
-    } else {
-        // YTD Logic: From Jan 01 of that year up to the max_month
-        // Assumption: safeMonth format is 'YYYYMM' (e.g., '202512')
-        if (safeMonth.length === 6) {
-            const year = safeMonth.substring(0, 4);
-            const startMonth = `${year}01`;
-            dateCondition = `month >= '${startMonth}' AND month <= '${safeMonth}'`;
-        } else {
-            // Fallback for weird formats -> treated as MTD to prevent crashes
-            dateCondition = `month = '${safeMonth}'`;
-        }
-    }
-
-    /* ----------------------------------------------------------------------
-       3. BUILD WHERE CLAUSE
-       ---------------------------------------------------------------------- */
-    const whereParts: string[] = [dateCondition];
-
-    // --- AO (Product) Logic ---
-    // If include_ao is FALSE (default), we EXCLUDE the 'AO' megabrand.
-    // If include_ao is TRUE, we allow 'AO' to pass through.
-    if (filters?.include_ao !== true) {
-        whereParts.push(`megabrand != 'AO'`);
-    }
-
-    // --- Standard Filters ---
-    if (filters?.megabrand?.length) {
-        // Safe quote wrapping
-        const brands = filters.megabrand.map((b: string) => `'${b.replace(/'/g, "")}'`).join(",");
-        whereParts.push(`megabrand IN (${brands})`);
-    }
-
-    if (filters?.region?.length) {
-        const regions = filters.region.map((r: string) => `'${r.replace(/'/g, "")}'`).join(",");
-        whereParts.push(`sls_regn_cd IN (${regions})`);
-    }
-
-    if (filters?.state?.length) {
-        const states = filters.state.map((s: string) => `'${s.replace(/'/g, "")}'`).join(",");
-        whereParts.push(`mktng_st_cd IN (${states})`);
-    }
-
-    if (filters?.wholesaler_id?.length) {
-        const wslrs = filters.wholesaler_id.map((w: string) => `'${w.replace(/'/g, "")}'`).join(",");
-        whereParts.push(`wslr_nbr IN (${wslrs})`);
-    }
-
-    if (filters?.channel?.length) {
-        const chans = filters.channel.map((c: string) => `'${c.replace(/'/g, "")}'`).join(",");
-        whereParts.push(`channel IN (${chans})`);
-    }
-
-    // Combine all parts
-    const whereClause = whereParts.filter(Boolean).join(" AND ");
-
-    /* ----------------------------------------------------------------------
-       4. CONSTRUCT SQL
-       ---------------------------------------------------------------------- */
-    
-    // Determine Group By Column
-    let groupCol = "month"; // Default for trend charts
-    let orderBy = "ORDER BY 1 ASC"; // Default time sort
-
-    switch (groupBy) {
-        case "region":
-            groupCol = "sls_regn_cd";
-            orderBy = "ORDER BY 2 DESC"; // Sort by Value CY
-            break;
-        case "state":
-            groupCol = "mktng_st_cd";
-            orderBy = "ORDER BY 2 DESC";
-            break;
-        case "wholesaler":
-            groupCol = "wslr_nbr";
-            orderBy = "ORDER BY 2 DESC";
-            break;
-        case "channel":
-            groupCol = "channel";
-            orderBy = "ORDER BY 2 DESC";
-            break;
-        case "megabrand":
-            groupCol = "megabrand";
-            orderBy = "ORDER BY 2 DESC";
-            break;
-        case "total":
-            groupCol = "'Total'"; // Constant string for single row aggregation
-            orderBy = ""; // No sort needed for single row
-            break;
-        case "time":
-        default:
-            groupCol = "month";
-            orderBy = "ORDER BY 1 ASC";
-            break;
-    }
-
-    // Aggregation Function
-    // Shares and Averages cannot be summed, they must be Averaged.
-    // Counts (Volume, Revenue) must be Summed.
-    const NON_ADDITIVE_KPIS = ["share", "adshare", "avd"];
-    const aggFunc = NON_ADDITIVE_KPIS.includes(kpi) ? "AVG" : "SUM";
-
-    const sql = `
-      SELECT 
-        ${groupCol} as key,
-        ${aggFunc}(value_cy) as val_cy,
-        ${aggFunc}(value_ly) as val_ly
-      FROM commercial_dev.capabilities.${table}
-      WHERE ${whereClause}
-      GROUP BY 1
-      ${orderBy}
-      LIMIT 5000
-    `;
-
-    /* ----------------------------------------------------------------------
-       5. EXECUTE QUERY (DATABRICKS)
-       ---------------------------------------------------------------------- */
+    // --- CREDENTIALS ---
     const host = process.env.DATABRICKS_HOST;
     const token = process.env.DATABRICKS_TOKEN;
     const warehouseId = process.env.WAREHOUSE_ID;
 
-    // 1. Submit Query
+    if (!host || !token || !warehouseId) return res.status(500).json({ ok: false, error: "Server missing Databricks credentials" });
+
+    const { kpi, filters, groupBy = "time", max_month = "202512", scope = "YTD" } = body as KpiRequestV1;
+
+    // --- 2. RESOLVE CONFIG ---
+    const config = KPI_MAP[kpi];
+    if (!config) return res.status(400).json({ ok: false, error: `KPI '${kpi}' is not configured in API map.` });
+
+    const tableName = `commercial_dev.capabilities.${config.table}`;
+    const colCy = `${config.col}_CY`;
+    const colLy = `${config.col}_LY`;
+    const AGG_FUNC = config.agg; 
+
+    // --- 3. FILTER LOGIC ---
+    const conditions: string[] = ["1=1"];
+
+    // A. TIME SCOPE
+    if (scope === "MTD") {
+      conditions.push(`cal_yr_mo_nbr = ${max_month}`);
+    } else {
+      const startOfYear = max_month.substring(0, 4) + "01";
+      conditions.push(`cal_yr_mo_nbr BETWEEN ${startOfYear} AND ${max_month}`);
+    }
+
+    // ✅ B. AO TOGGLE LOGIC
+    // If include_ao is NOT true, we explicitly exclude 'AO' megabrand.
+    // If it IS true, we simply don't filter it out (allowing it to appear).
+    if (filters?.include_ao !== true) {
+        conditions.push(`megabrand != 'AO'`);
+    }
+
+    // C. MEGABRAND
+    if (filters?.megabrand && filters.megabrand.length > 0) {
+      const list = filters.megabrand.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+      conditions.push(`megabrand IN (${list})`);
+    }
+
+    // D. REGION (sls_regn_cd)
+    if (filters?.region && filters.region.length > 0) {
+      const list = filters.region.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+      conditions.push(`sls_regn_cd IN (${list})`);
+    }
+
+    // E. STATE (mktng_st_cd)
+    if (filters?.state && filters.state.length > 0) {
+      const list = filters.state.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+      conditions.push(`mktng_st_cd IN (${list})`);
+    }
+
+    // F. WHOLESALER (wslr_nbr)
+    if (filters?.wholesaler_id && filters.wholesaler_id.length > 0) {
+      const list = filters.wholesaler_id.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+      conditions.push(`wslr_nbr IN (${list})`);
+    }
+
+    // G. CHANNEL (channel)
+    if (filters?.channel && filters.channel.length > 0) {
+      if (config.hasChannel) {
+          const list = filters.channel.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+          conditions.push(`channel IN (${list})`);
+      } else {
+          // If filtering by channel on a metric that lacks channel, return NO DATA (safe fallback)
+          conditions.push("1=0"); 
+      }
+    }
+
+    // --- 4. DYNAMIC GROUPING ---
+    let selectClause = "";
+    let groupByClause = "";
+    let orderByClause = "ORDER BY val_cy DESC";
+
+    switch (groupBy) {
+      case "megabrand":
+        selectClause = `megabrand as dimension`;
+        groupByClause = `GROUP BY megabrand`;
+        break;
+
+      case "region":
+        selectClause = `sls_regn_cd as dimension`;
+        groupByClause = `GROUP BY sls_regn_cd`;
+        break;
+
+      case "state":
+        selectClause = `mktng_st_cd as dimension`;
+        groupByClause = `GROUP BY mktng_st_cd`;
+        break;
+
+      case "wholesaler":
+        const geoCol = config.geoColumn;
+        selectClause = `${geoCol} as dimension`;
+        groupByClause = `GROUP BY ${geoCol}`;
+        break;
+
+      case "channel":
+        if (!config.hasChannel) {
+          selectClause = `'All Channels' as dimension`;
+          groupByClause = ``;
+        } else {
+          selectClause = `channel as dimension`;
+          groupByClause = `GROUP BY channel`;
+        }
+        break;
+
+      case "total": // ✅ Added to support Grand Totals for Matrices
+        selectClause = `'Total' as dimension`;
+        groupByClause = ``;
+        orderByClause = ""; 
+        break;
+
+      case "time":
+      default:
+        selectClause = `cal_yr_mo_nbr as dimension`;
+        groupByClause = `GROUP BY cal_yr_mo_nbr`;
+        orderByClause = "ORDER BY cal_yr_mo_nbr ASC";
+        break;
+    }
+
+    // --- 5. ASSEMBLE SQL ---
+    const finalSql = `
+      SELECT ${selectClause},
+      ${AGG_FUNC}(${colCy}) as val_cy,
+      ${AGG_FUNC}(${colLy}) as val_ly
+      FROM ${tableName}
+      WHERE ${conditions.join(" AND ")}
+      ${groupByClause}
+      ${orderByClause}
+      LIMIT 1000
+    `;
+
+    // --- 6. EXECUTE ---
     const submitRes = await fetch(`${host}/api/2.0/sql/statements`, {
       method: "POST",
-      headers: { 
-          Authorization: `Bearer ${token}`, 
-          "Content-Type": "application/json" 
-      },
-      body: JSON.stringify({ 
-          statement: sql, 
-          warehouse_id: warehouseId, 
-          wait_timeout: "35s" // Wait up to 35s for synchronous result
-      }),
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ statement: finalSql, warehouse_id: warehouseId }),
     });
 
-    const submitJson = await submitRes.json();
+    const submitted = await submitRes.json();
+    if (!submitRes.ok) return res.status(submitRes.status).json({ ok: false, error: "Databricks submit failed", dbx_msg: submitted?.message, sql: finalSql });
 
-    // 2. Handle Result or Polling
-    let result = submitJson.result;
-    const statementId = submitJson.statement_id;
+    const statementId = submitted?.statement_id;
+    if (!statementId) throw new Error("No statement_id returned");
 
-    // If query is taking longer than wait_timeout, we poll once (Basic Logic)
-    // Production recommendation: Use a robust polling loop here if queries are heavy.
-    if (!result && statementId) {
-         // Short wait before checking
-         await new Promise(r => setTimeout(r, 1000));
-         
-         const pollRes = await fetch(`${host}/api/2.0/sql/statements/${statementId}`, { 
-             headers: { Authorization: `Bearer ${token}` } 
-         });
-         const pollJson = await pollRes.json();
-         
-         if (pollJson.status?.state === "SUCCEEDED") {
-             result = pollJson.result;
-         } else if (pollJson.status?.state === "FAILED") {
-             throw new Error(pollJson.status.error?.message || "Query failed during execution");
-         }
+    const deadlineMs = Date.now() + 15000;
+    let last = submitted;
+
+    while (Date.now() < deadlineMs) {
+      const state = last?.status?.state;
+      if (["SUCCEEDED", "FAILED", "CANCELED"].includes(state)) break;
+      await sleep(350);
+      const pollRes = await fetch(`${host}/api/2.0/sql/statements/${statementId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      last = await pollRes.json();
     }
 
-    if (!result) {
-        // If still pending after poll, return empty or error
-        // Ideally, frontend handles retries, but we'll throw for now.
-        return res.status(202).json({ ok: false, error: "Query pending", statement_id: statementId });
-    }
+    if (last?.status?.state !== "SUCCEEDED") return res.status(502).json({ ok: false, error: "Query timed out or failed", state: last?.status?.state });
 
-    return res.status(200).json({ ok: true, result });
+    return res.status(200).json({ ok: true, result: last.result, version: API_VERSION, meta: { sql: finalSql } });
 
   } catch (err: any) {
-    console.error("[API Error] Query Failed:", err);
-    return res.status(500).json({ ok: false, error: err.message || "Internal Server Error" });
+    console.error("API Crash:", err);
+    return res.status(500).json({ ok: false, error: "Internal Server Error", details: err.message });
   }
 }
